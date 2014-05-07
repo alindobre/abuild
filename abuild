@@ -1,0 +1,56 @@
+#!/bin/bash
+
+set -e -o pipefail
+shopt -s dotglob extglob nullglob
+umask 0022
+unset LANG LC_{ALL,COLLATE,CTYPE,MESSAGES,MONETARY,NUMERIC,TIME}
+
+if [[ -d ${0%/*}/../lib/abuild ]]; then
+  LIBRARY=$(cd -- "${0%/*}/../lib/abuild" && echo $PWD)
+elif [[ -d ${0%/*}/lib ]]; then
+  LIBRARY=$(cd -- "${0%/*}" && echo $PWD)
+else
+  echo "Failed to identify abuild library path" >&2
+  exit 1
+fi
+
+source "$LIBRARY/shared"
+
+if [[ $# -lt 2 ]]; then
+  warn "Usage: abuild PKG - [FEATURE[=TYPE]]..."
+  warn "       abuild PKG DST [FEATURE[=TYPE]]..."
+  exit 64
+elif [[ $UID -ne 0 ]]; then
+  die "Unprivileged builds must be run under pseudo or fakeroot"
+elif [[ ! -f $1/build ]]; then
+  die "$1/build not found: is $1 an abuild package?"
+fi
+
+CACHE=${CACHE:-/var/cache/abuild}
+PKG=$(cd -- "$1" && echo $PWD)
+unset DST SRC
+
+if [[ $2 == - ]]; then
+  setup "${@:3}"
+  exit
+fi
+
+if ! mkdir -- "$2" 2>/dev/null; then
+  die "Destination directory $2 already exists"
+fi
+
+trap 'rm -f -r ${DST:+"$DST"} ${SRC:+"$SRC"}' EXIT
+DST=$(cd -- "$2" && echo $PWD)
+SRC=$(mktemp -d --tmpdir src-XXXXXX)
+
+setup "${@:3}"
+
+trap 'die "Failed to prepare source tree"' ERR
+( cd "$SRC" && prepare )
+
+trap 'die "Failed to build package"' ERR
+( cd "$SRC" && build 2>&1 )
+( cd "$DST" && tidy )
+
+unset DST
+echo "Package built and installed in $2"

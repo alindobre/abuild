@@ -1,0 +1,357 @@
+NAME=
+VERSION=
+
+declare -A -g FEATURES=()
+declare -a -g SOURCES=()
+
+apply() {
+  local DIR FILE OPTARG OPTIND OPTION STRIP=1
+
+  while getopts :p:C: OPTION; do
+    case $OPTION in
+      p)
+        if [[ $OPTARG != @(0|[1-9]*([0-9])) ]]; then
+          die "Invalid prefix length to strip"
+        fi
+        STRIP=$OPTARG
+        ;;
+      C)
+        if ! mkdir -p -- "$OPTARG" 2>/dev/null; then
+          die "Failed to create directory '$OPTARG'"
+        fi
+        DIR=$OPTARG
+        ;;
+    esac
+  done
+  shift $(($OPTIND - 1))
+
+  if [[ $# -eq 1 ]] && [[ -f $PKG/$1 ]]; then
+    FILE=$PKG/$1
+  else
+    FILE=$CACHE/${2:-${1##*/}}
+    mkdir -p "$CACHE"
+    fetch "$1" "$FILE"
+  fi
+
+  case $FILE in
+    *.gz)
+      zcat -- "$FILE"
+      ;;
+    *.bz2)
+      bzcat -- "$FILE"
+      ;;
+    *.xz)
+      xzcat -- "$FILE"
+      ;;
+    *)
+      cat -- "$FILE"
+      ;;
+  esac | patch -d "${DIR:-.}" -p $STRIP -s -t -N --merge --no-backup
+}
+
+build() {
+  die "Package neither declares mode nor defines build()"
+}
+
+die() {
+  if [[ $# -gt 0 ]]; then
+    echo "$*" >&2
+  fi
+  exit 1
+}
+
+disable() {
+  while [[ $# -gt 0 ]]; do
+    unset "FEATURES[$1]"
+    shift
+  done
+}
+
+enable() {
+  while [[ $# -gt 0 ]]; do
+    if [[ $1 == *=?* ]]; then
+      if [[ ${FEATURES[${1%%=*}]} != ?(${1#*=}) ]]; then
+        die "Conflicting type requirements for feature ${1%%=*}"
+      fi
+      FEATURES[${1%%=*}]=${1#*=}
+    elif [[ -z ${FEATURES[$1]+defined} ]]; then
+      FEATURES[$1]=
+    fi
+    shift
+  done
+}
+
+enabled() {
+  while [[ $# -gt 0 ]]; do
+    if [[ -z ${FEATURES[${1%%=*}]+defined} ]]; then
+      return 1
+    elif [[ $1 == *=* ]] && [[ ${FEATURES[${1%%=*}]} != ${1#*=} ]]; then
+      return 1
+    fi
+    shift
+  done
+}
+
+feature() {
+  if [[ -z ${FEATURES[$1]+defined} ]]; then
+    return 1
+  elif [[ -n ${FEATURES[$1]} ]]; then
+    echo "${FEATURES[$1]}"
+  fi
+}
+
+fetch() {
+  local HASH LINEHASH LINENAME
+
+  set -- "$1" "${2:-${1##*/}}"
+
+  if [[ ! -f $2 ]]; then
+    echo "Downloading ${2##*/} from $1:"
+    if ! curl -f -o "$2.part" -C - -L -# "$1" 2>&1; then
+      die "Failed to fetch $URL"
+    fi
+    mv "$2.part" "$2"
+  fi
+
+  read HASH _ <<< $(sha256sum "$2")
+  if [[ -f $PKG/sources ]]; then
+    while read LINEHASH LINENAME; do
+      if [[ $LINENAME == ${2##*/} ]]; then
+        if [[ $LINEHASH != $HASH ]]; then
+          die "${2##*/} does not match hash $LINEHASH"
+        fi
+        return
+      fi
+    done < $PKG/sources
+  fi
+  echo "$HASH ${2##*/}" >>$PKG/sources
+}
+
+mode() {
+  if [[ -f $LIBRARY/$1 ]]; then
+    source "$LIBRARY/$1"
+  else
+    die "Unrecognised build mode '$1'"
+  fi
+}
+
+name() {
+  NAME=$1
+  if [[ -z $DST ]]; then
+    echo "name $1"
+  fi
+}
+
+prepare() {
+  local FILE
+
+  if [[ ${#SOURCES[@]} -eq 0 ]]; then
+    die "Package neither declares sources nor defines prepare()"
+  fi
+
+  for FILE in "${SOURCES[@]}"; do
+    case "$FILE" in
+      *.tar | *.@(tar.|t)@(gz|bz2|xz) | *.zip)
+        unpack "$FILE"
+        ;;
+      *.@(diff|patch)@(|.gz|.bz2|.xz))
+        apply "$FILE"
+        ;;
+      *)
+        die "Ignored unrecognised source type for '$FILE'"
+        ;;
+    esac
+  done
+}
+
+requires() {
+  if [[ -z $DST ]]; then
+    echo "requires $*"
+  fi
+}
+
+setup() {
+  NAME=${PKG##*/}
+  VERSION=unknown
+  CHOST=$(gcc -dumpmachine)
+  MAKEFLAGS=-j$(set /sys/devices/system/cpu/cpu[0-9]* && echo $((1 + $#)))
+  unset CFLAGS LDFLAGS
+  export MAKEFLAGS
+
+  set -o allexport
+  if [[ -f /etc/abuild.conf ]]; then
+    source /etc/abuild.conf
+  fi
+  set +o allexport
+
+  while [[ $# -gt 0 ]]; do
+    if [[ $1 == no-* ]]; then
+      disable "${1#no-}"
+    else
+      enable "$1"
+    fi
+    shift
+  done
+
+  if [[ -f $PKG/build ]]; then
+    source "$PKG/build"
+  else
+    die "$PKG/build not found"
+  fi
+}
+
+sources() {
+  SOURCES=( "${SOURCES[@]]}" "$@" )
+}
+
+tidy() {
+  chmod -f -R a+rX,u+w,g-w,o-w .
+  find . -type d -exec chmod a-st {} +
+  find . -name '*.la' -xtype f -delete
+  rm -f -r etc var
+
+  find . -lname '/*' -print0 | while read -d '' -r LINK; do
+    die "$LINK is an absolute symlink"
+  done
+
+  find . -lname './*' -print0 | while read -d '' -r LINK; do
+    die "$LINK is a non-canonical symlink"
+  done
+
+  find . -xtype l -print0 | while read -d '' -r LINK; do
+    die "$LINK is a dangling symlink"
+  done
+
+  find . -type f -print0 | while read -d '' -r FILE; do
+    case $FILE in
+      ./bin/*)
+        if [[ ! -x $FILE ]]; then
+          die "$FILE is in /bin but not executable"
+        fi
+        ;;
+      ./lib/*)
+        ;;
+      *)
+        die "$FILE is neither in /bin nor /lib"
+        ;;
+    esac
+
+    MODE=$(stat -c %a "$FILE")
+    case $MODE in
+      4???)
+        if ! enabled setuid; then
+          die "$FILE has been installed setuid"
+        fi
+        ;;
+      2???)
+        if ! enabled setgid; then
+          die "$FILE has been installed setgid"
+        fi
+        ;;
+      *)
+        chown -f 0:0 "$FILE"
+        chmod -f a-st "$FILE"
+        ;;
+    esac
+
+    if [[ $(hexdump -e '/1 "%02x"' -n 4 -v "$FILE") == 7f454c46 ]]; then
+      if [[ $(hexdump -e '/1 "%02x"' -n 2 -s 16 -v "$FILE") == 0200 ]]; then
+        # ELF executable
+        strip --strip-unneeded "$FILE"
+        if ! enabled rpaths && readelf -d "$FILE" | grep -q ' (RPATH) '; then
+          die "$FILE has been incorrectly compiled with an RPATH"
+        fi
+      elif [[ $(hexdump -e '/1 "%02x"' -n 2 -s 16 -v "$FILE") == 0300 ]]; then
+        # ELF shared object
+        strip --strip-unneeded "$FILE"
+        if ! enabled rpaths && readelf -d "$FILE" | grep -q ' (RPATH) '; then
+          die "$FILE has been incorrectly compiled with an RPATH"
+        fi
+
+        if [[ $FILE == ./lib/*.so?(.+([.0-9])) ]]; then
+          # ELF shared library
+          if [[ $FILE != */ld-+([.0-9]).so ]]; then
+            chmod a-x "$FILE"
+          fi
+        fi
+      fi
+    elif [[ $(hexdump -e '/1 "%02x"' -n 2 -v "$FILE") == 2321 ]]; then
+      # Script with '#!' magic
+      sed -e '1s:^#! *//*:#!/:' \
+          -e '1s:^#!/usr/local/:#!/:' \
+          -e '1s:^#!/usr/:#!/:' \
+          -e '1s:^#!/bin/env  *\([^ =][^ =]*\)\( \|$\):#!/bin/\1\2:' \
+          -i "$FILE"
+    else
+      chmod a-x "$FILE"
+    fi
+  done
+
+  if ! enabled docs; then
+    rm -f -r lib/{doc,info,man}
+  fi
+
+  if ! enabled staticlibs; then
+    find . -name '*.so' -xtype f -print0 | while read -d '' -r FILE; do
+      rm -f "${FILE%.so}.a"
+    done
+  fi
+
+  mkdir -p lib/{shared,static}
+  find lib lib/shared -maxdepth 1 -name '*.[ao]' -xtype f \
+    -exec mv -t lib/static {} +
+  find lib lib/static -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) \
+    \! -name 'ld-linux*.so.*' -xtype f -exec mv -t lib/shared {} +
+
+  find . -depth -type d -empty -delete
+  find . -depth -exec touch -r . {} +
+}
+
+unpack() {
+  local DIR FILE OPTARG OPTIND OPTION STRIP=1
+  while getopts :p:C: OPTION; do
+    case $OPTION in
+      p)
+        if [[ $OPTARG != @(0|[1-9]*([0-9])) ]]; then
+          die "Invalid prefix length to strip"
+        fi
+        STRIP=$OPTARG
+        ;;
+      C)
+        if ! mkdir -p -- "$OPTARG" 2>/dev/null; then
+          die "Failed to create directory '$OPTARG'"
+        fi
+        DIR=$OPTARG
+        ;;
+    esac
+  done
+  shift $(($OPTIND - 1))
+
+  if [[ $# -eq 1 ]] && [[ -f $PKG/$1 ]]; then
+    FILE=$PKG/$1
+  else
+    FILE=$CACHE/${2:-${1##*/}}
+    mkdir -p "$CACHE"
+    fetch "$1" "$FILE"
+  fi
+
+  if tar -x -f "$FILE" -C "${DIR:-.}" --no-same-owner --no-same-permissions \
+       --strip-components=$STRIP; then
+    chmod -f -R +rwX "${DIR:-.}"
+  else
+    die "Failed to unpack ${FILE##*/}"
+  fi
+}
+
+version() {
+  VERSION=$1
+  if [[ -z $DST ]]; then
+    echo "version $1"
+  fi
+}
+
+warn() {
+  if [[ $# -gt 0 ]]; then
+    echo "$*" >&2
+  fi
+}

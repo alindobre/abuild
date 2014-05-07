@@ -1,0 +1,32 @@
+declare -A -g INSTALLARGS=(
+  [--prefix]='--prefix='
+  [--root]="--root=$DST"
+)
+
+install-extra() {
+  while [[ $# -gt 0 ]]; do
+    INSTALLARGS[${1%%=*}]=$1
+    shift
+  done
+}
+
+install-remove() {
+  while [[ $# -gt 0 ]]; do
+    unset "INSTALLARGS[${1%%=*}]"
+    shift
+  done
+}
+
+install-reset() {
+  INSTALLARGS=()
+  install-extra "$@"
+}
+
+build() {
+  pre-install
+  python setup.py install "${INSTALLARGS[@]}"
+  post-install
+}
+
+pre-install() { :; }
+post-install() { :; }
