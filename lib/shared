@@ -178,9 +178,10 @@ setup() {
   unset CFLAGS LDFLAGS
   export MAKEFLAGS
 
+  ACONF=${ACONF:-/etc/abuild.conf}
   set -o allexport
-  if [[ -f /etc/abuild.conf ]]; then
-    source /etc/abuild.conf
+  if [[ -f $ACONF ]]; then
+    source $ACONF
   fi
   set +o allexport
 
